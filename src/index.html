@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https: data: blob:; script-src 'self' 'unsafe-inline'; img-src 'self' https: data: blob:; style-src 'self' 'unsafe-inline' https:; connect-src 'self' https:; frame-src https: http: data: blob:;" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Nexa Browser</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="ambient ambient-a"></div>
+  <div class="ambient ambient-b"></div>
+
+  <main class="app-shell" id="appShell">
+    <header class="topbar">
+      <div class="brand" title="Nexa Browser">
+        <div class="brand-mark">N</div>
+        <span>Nexa</span>
+      </div>
+
+      <div class="tabs-wrap" id="tabs"></div>
+      <button class="icon-btn add-tab" id="newTab" title="Nueva pestaña">+</button>
+      <button class="icon-btn top-menu" id="menuBtn" title="Menú">⋮</button>
+    </header>
+
+    <section class="toolbar">
+      <div class="nav-actions">
+        <button class="icon-btn" id="backBtn" title="Atrás">←</button>
+        <button class="icon-btn" id="forwardBtn" title="Adelante">→</button>
+        <button class="icon-btn" id="reloadBtn" title="Recargar">↻</button>
+      </div>
+
+      <form class="address-row" id="addressForm">
+        <span class="shield" id="shield" title="Protección Nexa activa">✓</span>
+        <input id="address" autocomplete="off" spellcheck="false" placeholder="Buscar o escribir una dirección" />
+        <button class="address-action" id="compareBtn" type="button" title="Comparar páginas">⇄</button>
+        <button class="address-action" id="focusBtn" type="button" title="Modo concentración">◌</button>
+      </form>
+
+      <div class="toolbar-actions">
+        <button class="icon-btn" id="sidebarBtn" title="Barra lateral">☰</button>
+        <button class="icon-btn" id="settingsBtn" title="Configuración">⚙</button>
+      </div>
+    </section>
+
+    <section class="body">
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-section">
+          <div class="section-title">Espacios</div>
+          <div id="workspaceList"></div>
+          <button class="sidebar-item subtle" id="addWorkspace">＋ Nuevo espacio</button>
+        </div>
+        <div class="sidebar-section">
+          <div class="section-title">Nexa</div>
+          <button class="sidebar-item active" data-panel="home">⌂ Inicio</button>
+          <button class="sidebar-item" data-panel="favorites">★ Favoritos</button>
+          <button class="sidebar-item" data-panel="history">◷ Historial</button>
+          <button class="sidebar-item" data-panel="downloads">⇩ Descargas</button>
+          <button class="sidebar-item" data-panel="notes">✎ Notas</button>
+          <button class="sidebar-item" data-panel="ai">✦ IA</button>
+          <button class="sidebar-item" data-panel="extensions">⊞ Extensiones</button>
+          <button class="sidebar-item" data-panel="quick">⚡ Acciones rápidas</button>
+          <button class="sidebar-item" data-panel="dashboard">▦ Panel personalizable</button>
+        </div>
+      </aside>
+
+      <section class="content" id="content"></section>
+    </section>
+
+    <div class="toast" id="toast"></div>
+  </main>
+
+  <dialog id="settingsDialog">
+    <div class="dialog-head">
+      <div>
+        <span class="eyebrow">NEXA</span>
+        <h2>Configuración</h2>
+      </div>
+      <button class="icon-btn" id="closeSettings">×</button>
+    </div>
+    <div class="settings-grid">
+      <label>Buscador
+        <select id="searchEngine">
+          <option value="https://www.google.com/search?q=">Google</option>
+          <option value="https://www.bing.com/search?q=">Bing</option>
+          <option value="https://duckduckgo.com/?q=">DuckDuckGo</option>
+        </select>
+      </label>
+      <label>Glassmorphism <span id="glassValue">70%</span>
+        <input id="glass" type="range" min="20" max="100" value="70" />
+      </label>
+      <label>Tema
+        <select id="theme">
+          <option value="auto">Automático</option>
+          <option value="dark">Oscuro</option>
+          <option value="light">Claro</option>
+        </select>
+      </label>
+      <label class="check"><input id="privacyToggle" type="checkbox" checked /> Protección de rastreadores y anuncios</label>
+      <label class="check"><input id="aiToggle" type="checkbox" checked /> IA opcional/local</label>
+    </div>
+    <div class="dialog-foot">
+      <button class="primary" id="saveSettings">Guardar</button>
+      <button class="ghost" id="importSettings">Importar configuración</button>
+      <button class="ghost" id="recommendSettings">Recomendar ajustes</button>
+    </div>
+  </dialog>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
