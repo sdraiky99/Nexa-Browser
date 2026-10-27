@@ -1,44 +1,85 @@
 {
-  "name": "nexa-browser",
-  "version": "0.1.0",
-  "description": "Nexa Browser — MVP de navegador privado y personalizable.",
-  "main": "src/main.js",
+  "name": "nova-browser",
+  "productName": "Nova",
+  "version": "6.3.1",
+  "description": "Nova 6.3.1 — Minimal Reborn: diseño minimalista, Nova Assist, acentos personalizables y tema secreto Eclipse.",
+  "author": "Nova",
+  "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder --publish never",
-    "dist": "electron-builder --publish never"
+    "dist": "npm run dist:win",
+    "dist:setup": "electron-builder --win nsis --publish never -c.directories.output=dist/setup",
+    "dist:portable": "electron-builder --win portable --publish never -c.directories.output=dist/portable",
+    "dist:win": "npm run dist:setup && npm run dist:portable",
+    "check": "npm run check:distribution-config && npm run check:project && npm run check:syntax && npm run qa:6.3 && npm run check:build-assets && npm run check:performance",
+    "check:syntax": "node scripts/check-syntax-all.js",
+    "check:project": "node scripts/check-project.js",
+    "check:build-assets": "node scripts/check-build-assets.js",
+    "check:distribution-config": "node scripts/check-distribution-config.js",
+    "qa:6.3": "node scripts/qa-6.3.js",
+    "check:performance": "node scripts/performance-smoke.js"
+  },
+  "dependencies": {
+    "@ghostery/adblocker-electron": "2.18.2",
+    "cross-fetch": "4.1.0",
+    "sql.js": "1.14.2",
+    "electron-updater": "6.8.10"
   },
   "devDependencies": {
-    "electron": "^40.0.0",
-    "electron-builder": "^26.0.12"
+    "electron": "44.4.5",
+    "electron-builder": "26.17.0"
   },
   "build": {
-    "appId": "com.nexa.browser",
-    "productName": "Nexa Browser",
-    "asar": true,
-    "files": [
-      "src/**/*",
-      "package.json"
-    ],
+    "appId": "com.nova.browser",
+    "productName": "Nova",
     "directories": {
-      "output": "release"
+      "output": "dist"
     },
+    "files": [
+      "main.js",
+      "portable-user-data.js",
+      "migration.js",
+      "permission-policy.js",
+      "shell/**",
+      "assets/**",
+      "package.json",
+      "account-service.js",
+      "account-config.json"
+    ],
     "win": {
       "target": [
         "nsis",
-        "zip"
-      ]
-    },
-    "linux": {
-      "target": [
-        "AppImage",
-        "deb"
+        "portable"
       ],
-      "category": "Network"
+      "icon": "assets/brand/nova.ico"
     },
+    "portable": {
+      "artifactName": "Nova-Portable-${version}.exe"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "sdraiky99",
+        "repo": "NovaBrowser"
+      }
+    ],
+    "copyright": "Copyright © 2026 Nova",
     "nsis": {
+      "artifactName": "Nova-Setup-${version}.${ext}",
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "assets/brand/nova.ico",
+      "uninstallerIcon": "assets/brand/nova.ico",
+      "installerHeaderIcon": "assets/brand/nova.ico"
     }
+  },
+  "homepage": "https://github.com/sdraiky99/NovaBrowser",
+  "engines": {
+    "node": ">=22.12.0"
   }
 }

@@ -1,0 +1,1075 @@
+const { app, BrowserWindow, ipcMain, session, dialog, Menu, clipboard, safeStorage, shell, webContents, nativeImage } = require('electron');
+const path = require('path'), fs = require('fs'), { execFile } = require('child_process');
+const fetch = require('cross-fetch');
+let autoUpdater = null;
+try {
+  if (app.isPackaged && !process.env.PORTABLE_EXECUTABLE_FILE) {
+    ({ autoUpdater } = require('electron-updater'));
+    autoUpdater.autoDownload = false;
+    autoUpdater.autoInstallOnAppQuit = false;
+    autoUpdater.allowDowngrade = false;
+  }
+} catch (e) { console.warn('Nova updater unavailable:', e.message); }
+const APP_ID = 'com.nova.browser';
+app.setName('Nova');
+const { configurePortableUserData } = require('./portable-user-data.js');
+const { normalizeHttpOrigin, isHttpOrigin, permissionKeysForRequest, permissionDecision, permissionRequestLabel } = require('./permission-policy.js');
+const portableDataStatus = configurePortableUserData(app, process.env);
+app.setAppUserModelId(APP_ID); // imprescindible en Windows: agrupa la ventana con el acceso directo y permite cambiar el icono de la barra de tareas
+// rendimiento: rasterizado por GPU y sin el cálculo de oclusión de Windows (evita tirones al volver a la ventana)
+app.commandLine.appendSwitch('enable-gpu-rasterization');
+app.commandLine.appendSwitch('enable-zero-copy');
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+let win, splash, splashAt = 0, pendingUrl = null;
+const EXT = require('./shell/extensions.js');
+const { createMigrationService } = require('./migration.js');
+const migration = createMigrationService(app);
+const { createAccountService } = require('./account-service.js');
+const accounts = createAccountService({ app, safeStorage, fetch });
+const LOGOS = ['quantum'], SPLASH_MS = 500;
+const logoId = id => (LOGOS.includes(id) ? id : 'quantum');
+const logoIco = id => path.join(__dirname, 'assets/brand/nova.ico');      // único icono Nova dentro del paquete
+const logoImg = id => { const i = nativeImage.createFromPath(process.platform === 'win32' ? logoIco(id) : path.join(__dirname, 'assets/brand/nova-icon.png')); return i.isEmpty() ? nativeImage.createFromPath(path.join(__dirname, 'assets/brand/nova-icon.png')) : i; };
+// preferencias que el proceso principal necesita antes de abrir la interfaz (logo, animación de inicio, extensiones)
+let prefs = { logo: 'quantum', splash: true, ext: {}, reg: '', adblock: true };
+const prefsFile = () => path.join(app.getPath('userData'), 'prefs.json');
+const atomicWrite = (file, data) => {
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, file);
+};
+const loadPrefs = () => { try { prefs = Object.assign(prefs, JSON.parse(fs.readFileSync(prefsFile(), 'utf8'))); } catch { } prefs.logo = 'quantum'; savePrefs(); };
+const savePrefs = () => { try { atomicWrite(prefsFile(), JSON.stringify(prefs)); } catch { } };
+const { pathToFileURL, fileURLToPath } = require('url');
+const extUrl = a => { // enlace http(s) o archivo .html/.pdf/.svg... recibido desde Windows (navegador predeterminado)
+  for (const x of a || []) {
+    if (/^https?:\/\//i.test(x)) return x;
+    if (/\.(html?|xhtml|pdf|svg|webp|png|jpe?g|gif|txt)$/i.test(x) && !/^-/.test(x)) { try { if (fs.existsSync(x)) return pathToFileURL(path.resolve(x)).href; } catch { } }
+  }
+};
+// una sola instancia: si Nova es el navegador predeterminado, los enlaces llegan a la ventana abierta
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) app.quit();
+else app.on('second-instance', (_, argv) => {
+  if (!win) return; if (win.isMinimized()) win.restore(); win.show(); win.focus();
+  const u = extUrl(argv); if (u) win.webContents.send('open-tab', u);
+});
+const applyExt = (wc, ids) => {
+  if (wc.isDestroyed()) return;
+  const run = id => { const p = wc.executeJavaScript(EXT.on(id)); const t = new Promise((_, reject) => setTimeout(() => reject(new Error('extension-timeout')), 5000)); return Promise.race([p, t]).catch(() => { }); };
+  (ids || Object.keys(prefs.ext).filter(k => prefs.ext[k])).forEach(run);
+};
+const web = () => session.fromPartition('persist:web'); // datos de navegación aislados de la interfaz de Nova
+
+const userFile = (...p) => path.join(app.getPath('userData'), ...p);
+const SITE_PERMISSION_KEYS = new Set(['cam','mic','geo','notif']);
+const SITE_PERMISSION_VALUES = new Set(['ask','allow','block']);
+const sitePermissionsFile = () => userFile('site-permissions.json');
+function readSitePermissions() {
+  try {
+    const data = JSON.parse(fs.readFileSync(sitePermissionsFile(), 'utf8'));
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return {};
+    const out = {};
+    for (const [host, entries] of Object.entries(data)) {
+      const origin = normalizeHttpOrigin(host);
+      if (!origin || origin !== host.toLowerCase() || !entries || typeof entries !== 'object' || Array.isArray(entries)) continue;
+      const safe = {};
+      for (const [key, value] of Object.entries(entries)) if (SITE_PERMISSION_KEYS.has(key) && ['allow','block'].includes(value)) safe[key] = value;
+      if (Object.keys(safe).length) out[origin] = safe;
+    }
+    return out;
+  } catch { return {}; }
+}
+function writeSitePermissions(value) {
+  try { atomicWrite(sitePermissionsFile(), JSON.stringify(value)); return true; }
+  catch (error) { console.warn('Nova could not save site permissions:', error?.message); return false; }
+}
+function hostFromPermissionRequest(details, wc) {
+  try {
+    const raw = details?.requestingUrl || details?.securityOrigin || wc?.getURL?.() || '';
+    const url = new URL(raw);
+    return normalizeHttpOrigin(url.href);
+  } catch { return ''; }
+}
+
+let blockerP = null, blockOn = null, blockerAt = 0, blockerRefreshBusy = false;
+const AD_CACHE = () => userFile('adblock-2.18.bin');
+async function setAdblock(on) {
+  on = !!on;
+  if (blockOn === on) return true;
+  if (!on && !blockerP) { blockOn = false; return true; }
+  blockOn = on;
+  try {
+    if (!blockerP) blockerP = (async () => {
+      const { ElectronBlocker } = require('@ghostery/adblocker-electron');
+      // Cache versionada para no reutilizar un motor serializado de otra versión.
+      const cache = { path: AD_CACHE(), read: fs.promises.readFile, write: fs.promises.writeFile };
+      const fetcher = require('cross-fetch');
+      const load = () => ElectronBlocker.fromPrebuiltAdsAndTracking(fetcher, cache);
+      let b;
+      try { b = await load(); } catch { b = await ElectronBlocker.fromPrebuiltAdsAndTracking(fetcher); }
+      let bt = 0, n = 0;
+      b.on('request-blocked', () => {
+        n++;
+        if (!bt) bt = setTimeout(() => { bt = 0; if (win && !win.isDestroyed()) win.webContents.send('blocked', n); }, 600);
+      });
+      blockerAt = Date.now();
+      return b;
+    })();
+    const b = await blockerP; if (blockOn !== on) return false;
+    const ses = web();
+    on ? b.enableBlockingInSession(ses) : b.disableBlockingInSession(ses);
+    return true;
+  } catch (e) {
+    blockerP = null;
+    blockOn = null;
+    console.error('Adblock:', e.message);
+    return false;
+  }
+}
+
+async function refreshAdblockLists() {
+  if (!blockOn || blockerRefreshBusy) return;
+  blockerRefreshBusy = true;
+  try {
+    const oldP = blockerP;
+    if (oldP) { try { (await oldP).disableBlockingInSession(web()); } catch { } }
+    blockerP = null; blockOn = false;
+    try { fs.rmSync(AD_CACHE(), { force: true }); } catch { }
+    await setAdblock(true);
+  } finally { blockerRefreshBusy = false; }
+}
+const adblockRefreshTimer = setInterval(() => { if (blockerAt && Date.now() - blockerAt > 7 * 24 * 3600e3) refreshAdblockLists().catch(() => { }); }, 30 * 60e3);
+adblockRefreshTimer.unref?.();
+
+
+/* ---------- Windows: registro como navegador y logotipo en la barra de tareas ---------- */
+const reg = (...a) => new Promise(r => execFile('reg.exe', a, { windowsHide: true }, (e, out) => r(e ? null : String(out))));
+const regAdd = (key, name, val) => reg('add', 'HKCU\\' + key, name ? '/v' : '/ve', ...(name ? [name] : []), '/t', 'REG_SZ', '/d', val, '/f');
+// Windows 10/11 solo deja elegir como predeterminado a los navegadores registrados con estas claves.
+// El instalador ya las crea; esto las repara/actualiza solo si cambió la ruta o la versión (no hace nada más).
+async function registerBrowser(force) {
+  if (process.platform !== 'win32' || process.env.PORTABLE_EXECUTABLE_FILE || !app.isPackaged) return;
+  const sig = process.execPath + '|' + app.getVersion(); if (!force && prefs.reg === sig) return;
+  const exe = process.execPath, cmd = `"${exe}" "%1"`, ico = `"${exe}",0`, C = 'Software\\Clients\\StartMenuInternet\\Nova';
+  const rows = [
+    ['Software\\Classes\\NovaURL', '', 'Nova URL'], ['Software\\Classes\\NovaURL', 'URL Protocol', ''], ['Software\\Classes\\NovaURL\\DefaultIcon', '', ico], ['Software\\Classes\\NovaURL\\shell\\open\\command', '', cmd],
+    ['Software\\Classes\\NovaHTML', '', 'Nova HTML Document'], ['Software\\Classes\\NovaHTML\\DefaultIcon', '', ico], ['Software\\Classes\\NovaHTML\\shell\\open\\command', '', cmd],
+    [C, '', 'Nova'], [C + '\\DefaultIcon', '', ico], [C + '\\shell\\open\\command', '', `"${exe}"`],
+    [C + '\\Capabilities', 'ApplicationName', 'Nova'], [C + '\\Capabilities', 'ApplicationIcon', ico],
+    [C + '\\Capabilities', 'ApplicationDescription', 'Navegador web moderno basado en Chromium'],
+    [C + '\\Capabilities\\URLAssociations', 'http', 'NovaURL'], [C + '\\Capabilities\\URLAssociations', 'https', 'NovaURL'],
+    [C + '\\Capabilities\\FileAssociations', '.html', 'NovaHTML'], [C + '\\Capabilities\\FileAssociations', '.htm', 'NovaHTML'],
+    ['Software\\RegisteredApplications', 'Nova', C + '\\Capabilities']
+  ];
+  for (const [k, n, v] of rows) await regAdd(k, n, v);
+  prefs.reg = sig; savePrefs();
+}
+// ¿Es Nova el navegador que Windows usa de verdad? (lee la elección del usuario, no solo las claves de Nova)
+async function isWinDefault() {
+  const o = await reg('query', 'HKCU\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\UserChoice', '/v', 'ProgId');
+  return !!o && /NovaURL/i.test(o);
+}
+// Copia el .ico fuera del paquete (Windows no puede leer dentro de app.asar) y devuelve su ruta
+function iconFile(id) {
+  const dst = userFile('icons', `nova-${logoId(id)}.ico`);
+  try { fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.writeFileSync(dst, fs.readFileSync(logoIco(id))); return dst; } catch { return null; }
+}
+// Cambia el logotipo: ventana, barra de tareas (abierta y anclada), escritorio y menú Inicio
+function applyLogo(id) {
+  try { win && !win.isDestroyed() && win.setIcon(logoImg(id)); } catch { }
+  if (process.platform !== 'win32' || !app.isPackaged) return;
+  const f = iconFile(id); if (!f) return;
+  try { win && !win.isDestroyed() && win.setAppDetails({ appId: APP_ID, appIconPath: f, appIconIndex: 0, relaunchCommand: `"${process.execPath}"`, relaunchDisplayName: 'Nova' }); } catch { }
+  const dirs = [path.join(app.getPath('desktop')), path.join(process.env.APPDATA || '', 'Microsoft/Windows/Start Menu/Programs'), path.join(process.env.APPDATA || '', 'Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar'), path.join(process.env.APPDATA || '', 'Microsoft/Internet Explorer/Quick Launch')];
+  let changed = 0;
+  for (const d of dirs) {
+    let list = []; try { list = fs.readdirSync(d).filter(x => /\.lnk$/i.test(x)); } catch { continue; }
+    for (const n of list) {
+      const lnk = path.join(d, n);
+      try { const o = shell.readShortcutLink(lnk); if (path.resolve(o.target || '').toLowerCase() === path.resolve(process.execPath).toLowerCase() && shell.writeShortcutLink(lnk, 'update', { icon: f, iconIndex: 0 })) changed++; } catch { }
+    }
+  }
+  if (changed) execFile('ie4uinit.exe', ['-show'], { windowsHide: true }, () => { }); // refresca la caché de iconos de Windows
+}
+
+const isMainRenderer = sender => !!(win && !win.isDestroyed() && sender === win.webContents);
+const denyUntrusted = e => !isMainRenderer(e.sender);
+const safeWebUrl = u => {
+  try {
+    const x = new URL(u);
+    return x.protocol === 'http:' || x.protocol === 'https:' || x.protocol === 'file:' || (x.protocol === 'about:' && x.href === 'about:blank');
+  } catch { return false; }
+};
+const isNewTabFileUrl = raw => {
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'file:') return false;
+    const file = path.resolve(fileURLToPath(u));
+    const expected = path.resolve(__dirname, 'shell', 'newtab.html');
+    return process.platform === 'win32' ? file.toLowerCase() === expected.toLowerCase() : file === expected;
+  } catch { return false; }
+};
+const isTrustedNewTabContents = contents => {
+  try { return contents.getType() === 'webview' && isNewTabFileUrl(contents.getURL()); }
+  catch { return false; }
+};
+
+function createMain() {
+  win = new BrowserWindow({
+    width: 1280, height: 800, minWidth: 720, minHeight: 480,
+    frame: false, show: false, title: 'Nova',
+    icon: logoImg(prefs.logo),
+    backgroundColor: '#0d0b1a',
+    webPreferences: { nodeIntegration: true, contextIsolation: false, webviewTag: true, webSecurity: true, allowRunningInsecureContent: false }
+  });
+  win.loadFile('shell/index.html');
+  win.once('ready-to-show', () => {
+    const go = () => { if (splash && !splash.isDestroyed()) splash.close(); win.show(); };
+    setTimeout(go, splash ? Math.max(0, splashAt + SPLASH_MS - Date.now()) : 0); // deja ver la animación de inicio
+  });
+  win.webContents.once('did-finish-load', () => { if (pendingUrl) setTimeout(() => win && win.webContents.send('open-tab', pendingUrl), 900); });
+  win.on('page-title-updated', e => e.preventDefault());
+  win.webContents.on('will-navigate', e => e.preventDefault());
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  win.webContents.on('before-input-event', (e, input) => { if (input.type === 'keyDown' && input.key === 'F12') { e.preventDefault(); try { win.webContents.toggleDevTools(); } catch { } } });
+  win.webContents.on('render-process-gone', () => { setTimeout(() => { try { if (win && !win.isDestroyed()) win.reload(); } catch { } }, 800); });
+  win.webContents.on('context-menu', (e, p) => {
+    if (!p.isEditable && !p.selectionText) return; const w = win.webContents;
+    Menu.buildFromTemplate([{ label: 'Cortar', enabled: p.editFlags.canCut, click: () => w.cut() }, { label: 'Copiar', enabled: p.editFlags.canCopy, click: () => w.copy() },
+      { label: 'Pegar', enabled: p.editFlags.canPaste, click: () => w.paste() }, { label: 'Seleccionar todo', click: () => w.selectAll() }]).popup({ window: win });
+  });
+}
+
+
+/* ---------- Chromium extensions: load, enable/disable, remove and restore ---------- */
+const realExtensions = new Map(); // partition -> Map(extensionId, loaded metadata)
+const validPartition = p => typeof p === 'string' && (/^persist:[a-z0-9_-]{1,80}$/i.test(p) || p === 'persist:web');
+const extStoreFile = () => userFile('real-extensions.json');
+const loadRealExtStore = () => { try { const x=JSON.parse(fs.readFileSync(extStoreFile(),'utf8')); return x && typeof x==='object' && !Array.isArray(x) ? x : {}; } catch { return {}; } };
+const saveRealExtStore = x => { try { atomicWrite(extStoreFile(), JSON.stringify(x)); return true; } catch (e) { console.warn('Nova extension state could not be saved:', e?.message); return false; } };
+const sessionForPartition = partition => session.fromPartition(partition || 'persist:web');
+const listStoredExtensions = partition => { const all=loadRealExtStore(); return Array.isArray(all[partition]) ? all[partition].filter(x=>x&&typeof x.id==='string'&&typeof x.path==='string') : []; };
+const rememberRealExt = (partition, meta) => { const all=loadRealExtStore(); all[partition]=Array.isArray(all[partition])?all[partition]:[]; all[partition]=all[partition].filter(x=>x&&x.id!==meta.id); all[partition].push({...meta,enabled:meta.enabled!==false}); return saveRealExtStore(all); };
+const updateStoredExt = (partition,id,patch) => { const all=loadRealExtStore(); const list=Array.isArray(all[partition])?all[partition]:[]; const i=list.findIndex(x=>x&&x.id===id); if(i<0)return false; list[i]={...list[i],...patch}; all[partition]=list; saveRealExtStore(all); return true; };
+const forgetRealExt = (partition,id) => { const all=loadRealExtStore(); all[partition]=(all[partition]||[]).filter(x=>x&&x.id!==id); if(!all[partition].length)delete all[partition]; saveRealExtStore(all); };
+async function loadOneRealExtension(partition, extPath, persist=true){
+  if(!validPartition(partition)) throw new Error('Perfil no válido.');
+  if(typeof extPath!=='string'||!path.isAbsolute(extPath)) throw new Error('Ruta no válida.');
+  const fullPath=path.resolve(extPath), manifestFile=path.join(fullPath,'manifest.json');
+  if(!fs.existsSync(manifestFile)) throw new Error('La carpeta no contiene manifest.json. Descomprime la extensión y selecciona la carpeta que contiene el manifiesto.');
+  let manifest; try { manifest=JSON.parse(fs.readFileSync(manifestFile,'utf8')); } catch { throw new Error('manifest.json no es válido.'); }
+  if(!manifest||typeof manifest!=='object'||Array.isArray(manifest)||!manifest.name) throw new Error('Manifest inválido: falta el nombre.');
+  if(![2,3].includes(Number(manifest.manifest_version))) throw new Error('Versión de manifest no compatible. Nova admite extensiones Chromium Manifest V2/V3 que Electron pueda ejecutar.');
+  if(typeof manifest.name!=='string'||manifest.name.trim().length===0||manifest.name.length>200) throw new Error('El nombre de la extensión no es válido.');
+  if(manifest.version!==undefined&&(typeof manifest.version!=='string'||manifest.version.length>64)) throw new Error('La versión de la extensión no es válida.');
+  const loadedMap=realExtensions.get(partition);
+  if(loadedMap){ const duplicate=[...loadedMap.values()].find(x=>path.resolve(x.path)===fullPath); if(duplicate)return duplicate; }
+  const ses=sessionForPartition(partition);
+  let loaded;
+  try { loaded=await ses.loadExtension(fullPath,{allowFileAccess:true}); }
+  catch(err) { throw new Error(`Chromium/Electron no pudo cargar esta extensión: ${String(err?.message||err).slice(0,220)}`); }
+  const stringList=v=>Array.isArray(v)?v.filter(x=>typeof x==='string').slice(0,30).map(x=>x.slice(0,180)):[];
+  const meta={id:loaded.id,name:String(loaded.name||manifest.name).slice(0,160),path:fullPath,version:String(loaded.version||manifest.version||'').slice(0,64),permissions:stringList(manifest.permissions),hostPermissions:stringList(manifest.host_permissions),enabled:true,loaded:true};
+  if(!realExtensions.has(partition))realExtensions.set(partition,new Map());
+  realExtensions.get(partition).set(meta.id,meta);
+  if(persist&&!rememberRealExt(partition,meta)){ try{ses.removeExtension(meta.id);}catch{} realExtensions.get(partition)?.delete(meta.id); throw new Error('No se pudo guardar el estado de la extensión en el perfil de Nova.'); }
+  return meta;
+}
+async function restoreRealExtensions(partition){
+  if(!validPartition(partition))return;
+  const list=listStoredExtensions(partition);
+  for(const x of list){
+    if(x.enabled===false)continue;
+    const already=realExtensions.get(partition)?.get(x.id);
+    if(already)continue;
+    try { if(x.path&&fs.existsSync(path.join(x.path,'manifest.json'))) await loadOneRealExtension(partition,x.path,false); }
+    catch(e){console.warn('Nova extension restore failed:',x?.path,e?.message);}
+  }
+}
+ipcMain.handle('extensions-list', async (e,data)=>{
+  if(denyUntrusted(e)||!validPartition(data?.partition))return {ok:false,items:[]};
+  try {
+    await restoreRealExtensions(data.partition);
+    const loaded=realExtensions.get(data.partition)||new Map();
+    const items=listStoredExtensions(data.partition).map(x=>({...x,desiredEnabled:x.enabled!==false,enabled:loaded.has(x.id),loaded:loaded.has(x.id)}));
+    return {ok:true,items};
+  } catch { return {ok:false,items:[]}; }
+});
+ipcMain.handle('extension-pick-load', async (e,data)=>{
+  if(denyUntrusted(e)||!validPartition(data?.partition))return {ok:false,error:'Solicitud no válida.'};
+  try{
+    const picked=await dialog.showOpenDialog(win,{title:'Seleccionar carpeta de extensión Chromium',properties:['openDirectory']});
+    if(picked.canceled||!picked.filePaths?.[0])return {ok:false,canceled:true,error:'Selección cancelada.'};
+    const meta=await loadOneRealExtension(data.partition,picked.filePaths[0],true); return {ok:true,...meta};
+  }catch(err){return {ok:false,error:err?.message||'No se pudo cargar la extensión.'};}
+});
+ipcMain.handle('extension-toggle', async (e,data)=>{
+  if(denyUntrusted(e)||!validPartition(data?.partition)||typeof data?.id!=='string'||typeof data?.enabled!=='boolean')return {ok:false,error:'Solicitud no válida.'};
+  const {partition,id,enabled}=data;
+  const record=listStoredExtensions(partition).find(x=>x.id===id);
+  if(!record)return {ok:false,error:'La extensión ya no está instalada.'};
+  const loadedMap=realExtensions.get(partition)||new Map();
+  if(!enabled){
+    try { sessionForPartition(partition).removeExtension(id); } catch(e) { console.warn('Nova extension remove during disable:',e?.message); }
+    loadedMap.delete(id); if(!realExtensions.has(partition))realExtensions.set(partition,loadedMap);
+    if(!updateStoredExt(partition,id,{enabled:false}))return {ok:false,error:'La extensión se desactivó, pero Nova no pudo guardar el cambio.'};
+    return {ok:true,enabled:false};
+  }
+  try{
+    if(loadedMap.has(id)){if(!updateStoredExt(partition,id,{enabled:true}))return {ok:false,error:'La extensión está cargada, pero Nova no pudo guardar el cambio.'};return {ok:true,enabled:true};}
+    const meta=await loadOneRealExtension(partition,record.path,false);
+    if(!updateStoredExt(partition,id,{...meta,enabled:true})){try{sessionForPartition(partition).removeExtension(meta.id);}catch{};realExtensions.get(partition)?.delete(meta.id);return {ok:false,error:'La extensión se cargó, pero Nova no pudo guardar el cambio.'};}
+    return {ok:true,enabled:true};
+  }catch(err){return {ok:false,error:err?.message||'No se pudo activar la extensión.'};}
+});
+ipcMain.handle('extension-unload', async (e,data)=>{
+  if(denyUntrusted(e)||!validPartition(data?.partition)||typeof data?.id!=='string')return false;
+  try{
+    try{sessionForPartition(data.partition).removeExtension(data.id);}catch{}
+    realExtensions.get(data.partition)?.delete(data.id); forgetRealExt(data.partition,data.id); return true;
+  }catch{return false;}
+});
+
+app.whenReady().then(() => {
+  if (!gotLock) return;
+  loadPrefs(); pendingUrl = extUrl(process.argv.slice(1));
+  restoreRealExtensions('persist:web').catch(() => {});
+  Menu.setApplicationMenu(null);
+  const ua = web().getUserAgent()
+    .replace(/\s?Electron\/\S+/i, '').replace(/\s?nova-browser\/\S+/i, '').replace(/\s?Nova\/\S+/i, '') + ' Nova/' + app.getVersion();
+  web().setUserAgent(ua);
+  // Restaura la preferencia de privacidad al arrancar, sin bloquear la apertura de la ventana.
+  setAdblock(prefs.adblock !== false).catch(() => {});
+
+  if (prefs.splash !== false) { // animación de inicio (se puede quitar en Personalizar)
+    splash = new BrowserWindow({
+      width: 420, height: 420, frame: false, transparent: true, resizable: false,
+      alwaysOnTop: true, skipTaskbar: true, icon: logoImg(prefs.logo)
+    });
+    splash.loadFile('shell/splash.html', { query: { logo: logoId(prefs.logo) } });
+    splashAt = Date.now();
+  }
+  createMain();
+  initAutoUpdater();
+  setTimeout(() => { registerBrowser(false).catch(() => { }); applyLogo('quantum'); }, 4000);
+
+  const dlMap = new Map(), dlSend = new Map();
+  web().on('will-download', (e, item) => {
+    const id = Date.now() + Math.random(), dir = app.getPath('downloads');
+    const rawName = path.basename(item.getFilename() || 'download');
+    let f = path.join(dir, rawName || 'download'), n = 1; const ext = path.extname(f), base = f.slice(0, f.length - ext.length);
+    while (fs.existsSync(f)) f = `${base} (${n++})${ext}`;
+    item.setSavePath(f); dlMap.set(id, item); let last = 0;
+    const send = (st, force) => { const t = Date.now(); if (!force && t - last < 400) return; last = t; win && win.webContents.send('dl', { id, name: path.basename(f), path: f, recv: item.getReceivedBytes(), total: item.getTotalBytes(), state: st }); };
+    dlSend.set(id, send); send('progressing', true);
+    item.on('updated', (_, s) => send(s === 'interrupted' ? 'interrupted' : item.isPaused() ? 'paused' : 'progressing'));
+    item.once('done', (_, st) => { dlMap.delete(id); dlSend.delete(id); send(st === 'interrupted' ? 'interrupted' : st, true); });
+  });
+  ipcMain.on('dl-ctl', (e, data) => {
+    if (denyUntrusted(e) || !data || typeof data !== 'object') return;
+    const { id, a } = data;
+    const it = dlMap.get(id), s = dlSend.get(id); if (!it) return;
+    if (a === 'pause') { it.pause(); s('paused', true); } if (a === 'resume') { it.resume(); s('progressing', true); } if (a === 'cancel') it.cancel();
+  });
+  // Permisos por sitio: la decisión explícita se guarda por origen web y por tipo.
+  let perms = { cam: 'ask', mic: 'ask', geo: 'ask', notif: 'ask' };
+  ipcMain.on('perm-policy', (e, p) => { if (denyUntrusted(e) || !p || typeof p !== 'object') return; const clean = {}; for (const k of SITE_PERMISSION_KEYS) if (SITE_PERMISSION_VALUES.has(p[k])) clean[k] = p[k]; perms = Object.assign(perms, clean); });
+  const SAFE = ['fullscreen', 'clipboard-sanitized-write', 'pointerLock'];
+  ipcMain.handle('permission-sites-list', e => {
+    if (denyUntrusted(e)) return [];
+    return Object.entries(readSitePermissions()).map(([host, permissions]) => ({ host, permissions })).sort((a,b)=>a.host.localeCompare(b.host));
+  });
+  ipcMain.handle('permission-site-set', (e, payload) => {
+    if (denyUntrusted(e) || !payload || typeof payload !== 'object') return {ok:false,error:'Solicitud no válida.'};
+    const host=normalizeHttpOrigin(payload.host), key=String(payload.key||''), value=String(payload.value||'');
+    if(!isHttpOrigin(payload.host)||!host||!SITE_PERMISSION_KEYS.has(key)||!SITE_PERMISSION_VALUES.has(value)) return {ok:false,error:'Permiso no válido.'};
+    const all=readSitePermissions();all[host]=all[host]||{};
+    if(value==='ask') delete all[host][key]; else all[host][key]=value;
+    if(!Object.keys(all[host]).length) delete all[host];
+    return writeSitePermissions(all)?{ok:true}:{ok:false,error:'No se pudieron guardar los permisos.'};
+  });
+  ipcMain.handle('permission-site-reset', (e, rawHost) => {
+    if (denyUntrusted(e) || !isHttpOrigin(rawHost)) return false;
+    const all=readSitePermissions();delete all[normalizeHttpOrigin(rawHost)];return writeSitePermissions(all);
+  });
+  web().setPermissionRequestHandler((wc, perm, cb, d) => {
+    if (SAFE.includes(perm)) return cb(true);
+    const keys = permissionKeysForRequest(perm, d);
+    if (!keys.length) return cb(false);
+    const host = hostFromPermissionRequest(d, wc);
+    if (!host) return cb(false);
+    const site = readSitePermissions();
+    const decision = permissionDecision(keys, host, site, perms);
+    if (decision === 'allow') return cb(true);
+    if (decision === 'block') return cb(false);
+    const requestedLabel = permissionRequestLabel(keys);
+    dialog.showMessageBox(win, {
+      type: 'question',
+      buttons: ['Permitir siempre', 'Bloquear siempre', 'Ahora no'],
+      defaultId: 2,
+      cancelId: 2,
+      title: 'Permiso del sitio',
+      message: `${host} quiere usar ${requestedLabel}.`
+    }).then(result => {
+      if (result.response === 0 || result.response === 1) {
+        const all = readSitePermissions();
+        all[host] = all[host] || {};
+        for (const key of keys) all[host][key] = result.response === 0 ? 'allow' : 'block';
+        writeSitePermissions(all);
+      }
+      cb(result.response === 0);
+    }).catch(() => cb(false));
+  });
+  web().setPermissionCheckHandler((wc, perm, origin, details) => {
+    if (SAFE.includes(perm)) return true;
+    const keys = permissionKeysForRequest(perm, details);
+    if (!keys.length) return false;
+    const host = hostFromPermissionRequest({ requestingUrl: origin || details?.requestingUrl }, wc);
+    if (!host) return false;
+    return permissionDecision(keys, host, readSitePermissions(), perms) === 'allow';
+  });
+  app.on('web-contents-created', (_, c) => {
+    if (c.getType() === 'window') {
+      c.on('will-attach-webview', (e, wp, params) => {
+        // Solo la página local de nueva pestaña obtiene el puente limitado de Nova.
+        // Las páginas web nunca reciben Node integration ni una API privilegiada.
+        if (isNewTabFileUrl(params.src || '')) wp.preload = path.join(__dirname, 'shell', 'newtab-preload.js');
+        else delete wp.preload;
+        wp.nodeIntegration = false;
+        wp.nodeIntegrationInSubFrames = false;
+        wp.contextIsolation = true;
+        wp.sandbox = true;
+        wp.webSecurity = true;
+        wp.allowRunningInsecureContent = false;
+        wp.allowFileAccessFromFileUrls = false;
+        wp.allowUniversalAccessFromFileUrls = false;
+        if (!safeWebUrl(params.src || '')) e.preventDefault();
+      });
+      c.on('will-navigate', e => e.preventDefault()); c.setWindowOpenHandler(() => ({ action: 'deny' }));
+    }
+    if (c.getType() !== 'webview') return;
+    c.on('dom-ready', () => { try { c.setZoomMode?.('isolated'); } catch { } applyExt(c); });
+    c.on('unresponsive', () => { if (win && !win.isDestroyed()) win.webContents.send('tab-health', { type: 'unresponsive' }); });
+    c.on('responsive', () => { if (win && !win.isDestroyed()) win.webContents.send('tab-health', { type: 'responsive' }); });
+    c.on('render-process-gone', (_e, details) => {
+      if (win && !win.isDestroyed()) win.webContents.send('tab-health', { type: 'gone', reason: details && details.reason });
+      setTimeout(() => { try { if (!c.isDestroyed() && c.getURL()) c.reload(); } catch { } }, 800);
+    });
+    const allowNavigation = url => {
+      if (!safeWebUrl(url)) return false;
+      if (/^file:/i.test(url) && !/^file:/i.test(c.getURL() || '')) return false;
+      return true;
+    };
+    c.on('will-navigate', (e, url) => { if (!allowNavigation(url)) e.preventDefault(); });
+    c.on('will-redirect', (e, url) => { if (!allowNavigation(url)) e.preventDefault(); });
+    c.setWindowOpenHandler(({ url }) => { if (/^(https?:)/i.test(url)) win.webContents.send('open-tab', url); return { action: 'deny' }; });
+
+    c.on('before-input-event', (e, input) => { if (input.type === 'keyDown' && input.key === 'F12') { e.preventDefault(); try { c.toggleDevTools(); } catch { } } });
+
+    c.on('before-input-event', (e, input) => {
+      if (input.type !== 'keyDown' || !input.control || input.alt) return;
+      const key = String(input.key || ''), code = String(input.code || '');
+      const plus = key === '+' || code === 'Equal' && input.shift;
+      const minus = key === '-' || key === '_' || code === 'Minus';
+      if (!(plus || minus || key === '0')) return;
+      e.preventDefault();
+      try {
+        const current = Number(c.getZoomFactor?.() || 1);
+        const next = key === '0' ? 1 : Math.max(0.25, Math.min(5, +(current + (plus ? 0.1 : -0.1)).toFixed(2)));
+        c.setZoomFactor(next);
+        win && !win.isDestroyed() && win.webContents.send('zoom-changed', { webContentsId: c.id, factor: next });
+      } catch { }
+    });
+
+    c.on('context-menu', (e, p) => {
+      const T = [], nav = c.navigationHistory, send = (ch, d) => win.webContents.send(ch, d);
+      if (p.linkURL) T.push({ label: 'Abrir enlace en pestaña nueva', click: () => send('open-tab', p.linkURL) },
+        { label: 'Copiar dirección del enlace', click: () => clipboard.writeText(p.linkURL) }, { type: 'separator' });
+      if (p.mediaType === 'image') T.push({ label: 'Copiar imagen', click: () => c.copyImageAt(p.x, p.y) },
+        { label: 'Copiar dirección de la imagen', click: () => clipboard.writeText(p.srcURL) },
+        { label: 'Guardar imagen', click: () => c.downloadURL(p.srcURL) },
+        { label: 'Abrir imagen en pestaña nueva', click: () => send('open-tab', p.srcURL) }, { type: 'separator' });
+      if (p.isEditable) T.push({ label: 'Cortar', enabled: p.editFlags.canCut, click: () => c.cut() },
+        { label: 'Copiar', enabled: p.editFlags.canCopy, click: () => c.copy() },
+        { label: 'Pegar', enabled: p.editFlags.canPaste, click: () => c.paste() },
+        { label: 'Seleccionar todo', click: () => c.selectAll() }, { type: 'separator' });
+      const s = (p.selectionText || '').trim();
+      if (s) {
+        if (!p.isEditable) T.push({ label: 'Copiar', click: () => c.copy() });
+        T.push({ label: 'Buscar "' + s.slice(0, 24) + (s.length > 24 ? '…' : '') + '"', click: () => send('ctx-search', s) },
+          { label: 'Explicar con Nova IA', click: () => send('ask-ai', { m: 'exp', t: s }) },
+          { label: 'Traducir con Nova IA', click: () => send('ask-ai', { m: 'tr', t: s }) }, { type: 'separator' });
+      } else if (!p.isEditable) T.push({ label: 'Seleccionar todo', click: () => c.selectAll() }, { type: 'separator' });
+      T.push({ label: 'Atrás', enabled: nav.canGoBack(), click: () => nav.goBack() },
+        { label: 'Adelante', enabled: nav.canGoForward(), click: () => nav.goForward() },
+        { label: 'Recargar', click: () => c.reload() }, { type: 'separator' },
+        { label: 'Copiar dirección de la página', click: () => clipboard.writeText(c.getURL()) },
+        { label: 'Captura de pantalla', click: () => send('key', 'shot') },
+        { label: 'Inspeccionar elemento', click: () => c.inspectElement(p.x, p.y) });
+      Menu.buildFromTemplate(T).popup({ window: win });
+    });
+    c.on('before-input-event', (e, i) => {
+      if (i.control && i.type === 'keyDown' && ('twlfdhjkTrRDB '.includes(i.key) || i.key === 'Tab')) {
+        e.preventDefault(); win.webContents.send('key', i.key === 'Tab' ? (i.shift ? 'shift-tab' : 'tab') : i.key);
+      }
+    });
+  });
+});
+
+ipcMain.on('fullscreen', e => { if (denyUntrusted(e) || !win || win.isDestroyed()) return; try { win.setFullScreen(!win.isFullScreen()); } catch { } });
+ipcMain.handle('opacity', (e, v) => { if (denyUntrusted(e) || !win || win.isDestroyed() || typeof v !== 'number' || !Number.isFinite(v)) return false; try { win.setOpacity(Math.max(0.35, Math.min(1, v))); return true; } catch { return false; } });
+// Cristal real (Aero): el sistema difumina lo que hay detrás de la ventana. Solo Windows 11 22H2+ (build 22621); en otros sistemas se devuelve ok:false y la interfaz usa un fondo de respaldo.
+ipcMain.handle('window-material', (e, mode) => {
+  if (denyUntrusted(e) || !win || win.isDestroyed()) return { ok: false };
+  mode = mode === 'acrylic' ? 'acrylic' : 'none';
+  try {
+    const build = parseInt(String(require('os').release()).split('.')[2], 10) || 0;
+    if (process.platform !== 'win32' || build < 22621 || typeof win.setBackgroundMaterial !== 'function') return { ok: false, reason: 'unsupported' };
+    win.setBackgroundMaterial(mode);
+    win.setBackgroundColor(mode === 'acrylic' ? '#00000000' : '#0d0b1a');
+    return { ok: mode === 'acrylic', mode };
+  } catch (err) { return { ok: false, reason: String(err && err.message || err) }; }
+});
+ipcMain.on('win', (e, a) => {
+  if (denyUntrusted(e)) return;
+  if (a === 'min') win.minimize();
+  if (a === 'max') win.isMaximized() ? win.unmaximize() : win.maximize();
+  if (a === 'close') win.close();
+  if (a === 'full') win.setFullScreen(!win.isFullScreen());
+});
+ipcMain.on('app-version', e => { if (denyUntrusted(e)) return; e.returnValue = app.getVersion(); });
+ipcMain.on('prefs-get', e => { if (denyUntrusted(e)) return; e.returnValue = JSON.parse(JSON.stringify(prefs)); });
+ipcMain.on('prefs-set', (e, p) => {
+  if (denyUntrusted(e)) return;
+  if (!p || typeof p !== 'object') return;
+  if (LOGOS.includes(p.logo)) { prefs.logo = p.logo; applyLogo(p.logo); }
+  if (typeof p.splash === 'boolean') prefs.splash = p.splash;
+  if (p.ext && typeof p.ext === 'object') { // instalar / activar / quitar extensiones al instante
+    const nx = {}; Object.keys(p.ext).forEach(id => { if (EXT.byId(id)) nx[id] = !!p.ext[id]; });
+    const all = webContents.getAllWebContents().filter(w => w.getType() === 'webview' && !w.isDestroyed());
+    EXT.CATALOG.forEach(({ id }) => { const was = !!prefs.ext[id], now = !!nx[id]; if (was && !now) all.forEach(w => w.executeJavaScript(EXT.off(id)).catch(() => { })); if (!was && now) all.forEach(w => applyExt(w, [id])); });
+    prefs.ext = nx;
+  }
+  savePrefs();
+});
+ipcMain.handle('default-browser', async (e, set) => {
+  if (denyUntrusted(e)) return { portable: !!process.env.PORTABLE_EXECUTABLE_FILE, isDefault: false };
+  const portable = !!process.env.PORTABLE_EXECUTABLE_FILE;
+  if (process.platform !== 'win32') { if (set) { app.setAsDefaultProtocolClient('http'); app.setAsDefaultProtocolClient('https'); } return { portable, isDefault: app.isDefaultProtocolClient('https') }; }
+  if (portable) return { portable, isDefault: false };
+  if (set) {
+    await registerBrowser(true); // asegura que Nova figura en "Aplicaciones predeterminadas"
+    shell.openExternal('ms-settings:defaultapps?registeredAppUser=Nova').catch(() => shell.openExternal('ms-settings:defaultapps'));
+  }
+  return { portable, isDefault: await isWinDefault() };
+});
+ipcMain.on('userdata', e => { if (denyUntrusted(e)) return; e.returnValue = app.getPath('userData'); });
+ipcMain.on('portable-data-status', e => { if (denyUntrusted(e)) return; e.returnValue = { ...portableDataStatus, path: app.getPath('userData') }; });
+ipcMain.handle('install-cfg', e => { if (denyUntrusted(e)) return {}; 
+  try { return JSON.parse(fs.readFileSync(userFile('install.json'), 'utf8')); } catch { return {}; }
+});
+ipcMain.handle('adblock', async (e, on) => { if (denyUntrusted(e) || typeof on !== 'boolean') return false; const ok = await setAdblock(on); if (ok) { prefs.adblock = on; savePrefs(); } return ok; });
+ipcMain.handle('save-shot', (e, buf) => {
+  if (denyUntrusted(e) || (!Buffer.isBuffer(buf) && !(buf instanceof Uint8Array)) || buf.length > 25 * 1024 * 1024) return null;
+  const f = path.join(app.getPath('pictures'), `Nova-${Date.now()}.png`);
+  fs.writeFileSync(f, Buffer.from(buf)); return f;
+});
+ipcMain.handle('pick-wp', async (e, sec) => {
+  if (denyUntrusted(e) || typeof sec !== 'string' || !/^[a-z0-9_-]{1,40}$/i.test(sec)) return 0;
+  const r = await dialog.showOpenDialog(win, { filters: [{ name: 'Imágenes', extensions: ['jpg', 'jpeg', 'png', 'webp', 'svg'] }], properties: ['openFile', 'multiSelections'] });
+  if (r.canceled) return 0;
+  const dir = userFile('wallpapers', sec); fs.mkdirSync(dir, { recursive: true });
+  r.filePaths.forEach(f => fs.copyFileSync(f, path.join(dir, path.basename(f))));
+  return r.filePaths.length;
+});
+
+// Fondo de la barra de Nova: solo imágenes raster elegidas localmente, sin SVG ni contenido remoto.
+const toolbarWallpaperNames = ['nova-toolbar-wallpaper.png','nova-toolbar-wallpaper.jpg','nova-toolbar-wallpaper.jpeg','nova-toolbar-wallpaper.webp'];
+ipcMain.handle('toolbar-wallpaper-pick', async e => {
+  if (denyUntrusted(e)) return { ok:false, error:'Solicitud no válida.' };
+  try {
+    const picked = await dialog.showOpenDialog(win, { title:'Elegir fondo de la barra de Nova', properties:['openFile'], filters:[{ name:'Imágenes', extensions:['png','jpg','jpeg','webp'] }] });
+    if (picked.canceled || !picked.filePaths?.[0]) return { ok:false, canceled:true };
+    const source = picked.filePaths[0], ext = path.extname(source).slice(1).toLowerCase();
+    if (!['png','jpg','jpeg','webp'].includes(ext)) return { ok:false, error:'Formato no compatible. Usa PNG, JPG o WebP.' };
+    const stat = fs.statSync(source);
+    if (!stat.isFile() || stat.size < 16 || stat.size > 12 * 1024 * 1024) return { ok:false, error:'La imagen debe pesar entre 16 bytes y 12 MB.' };
+    const bytes = fs.readFileSync(source);
+    const validPng = bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]));
+    const validJpeg = bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+    const validWebp = bytes.toString('ascii',0,4) === 'RIFF' && bytes.toString('ascii',8,12) === 'WEBP';
+    if (!((ext==='png' && validPng) || (['jpg','jpeg'].includes(ext) && validJpeg) || (ext==='webp' && validWebp))) return { ok:false, error:'El archivo no parece ser una imagen válida del formato elegido.' };
+    const dir = userFile('wallpapers'); fs.mkdirSync(dir, { recursive:true });
+    for (const name of toolbarWallpaperNames) { try { fs.rmSync(path.join(dir,name), { force:true }); } catch {} }
+    const target = path.join(dir, `nova-toolbar-wallpaper.${ext}`);
+    fs.writeFileSync(target, bytes);
+    return { ok:true, url:pathToFileURL(target).href, name:path.basename(source), size:stat.size };
+  } catch (err) { return { ok:false, error:String(err?.message || 'No se pudo guardar la imagen.') }; }
+});
+ipcMain.handle('toolbar-wallpaper-clear', e => {
+  if (denyUntrusted(e)) return false;
+  try { const dir=userFile('wallpapers'); for (const name of toolbarWallpaperNames) fs.rmSync(path.join(dir,name),{force:true}); return true; } catch { return false; }
+});
+
+/* ---------- Nova 2.5 · DOCX minimal writer ---------- */
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    c ^= buf[i];
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+function zipDocx(entries) {
+  const files = [], central = [], localOffset = { value: 0 };
+  for (const [name, content] of entries) {
+    const data = Buffer.isBuffer(content) ? content : Buffer.from(content);
+    const comp = require('zlib').deflateRawSync(data, { level: 6 });
+    const nameBuf = Buffer.from(name);
+    const c = crc32(data);
+    const lh = Buffer.alloc(30);
+    lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(0, 6); lh.writeUInt16LE(8, 8);
+    lh.writeUInt16LE(0, 10); lh.writeUInt16LE(0, 12); lh.writeUInt32LE(c, 14); lh.writeUInt32LE(comp.length, 18); lh.writeUInt32LE(data.length, 22); lh.writeUInt16LE(nameBuf.length, 26); lh.writeUInt16LE(0, 28);
+    files.push(lh, nameBuf, comp);
+    const ch = Buffer.alloc(46);
+    ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6); ch.writeUInt16LE(0, 8); ch.writeUInt16LE(8, 10);
+    ch.writeUInt16LE(0, 12); ch.writeUInt16LE(0, 14); ch.writeUInt32LE(c, 16); ch.writeUInt32LE(comp.length, 20); ch.writeUInt32LE(data.length, 24); ch.writeUInt16LE(nameBuf.length, 28); ch.writeUInt16LE(0, 30); ch.writeUInt16LE(0, 32); ch.writeUInt16LE(0, 34); ch.writeUInt16LE(0, 36); ch.writeUInt32LE(0, 38); ch.writeUInt32LE(localOffset.value, 42);
+    central.push(ch, nameBuf);
+    localOffset.value += lh.length + nameBuf.length + comp.length;
+  }
+  const body = Buffer.concat(files), cbody = Buffer.concat(central), e = Buffer.alloc(22);
+  e.writeUInt32LE(0x06054b50, 0); e.writeUInt16LE(0, 4); e.writeUInt16LE(0, 6); const count = entries.length; e.writeUInt16LE(count, 8); e.writeUInt16LE(count, 10); e.writeUInt32LE(cbody.length, 12); e.writeUInt32LE(body.length, 16); e.writeUInt16LE(0, 20);
+  return Buffer.concat([body, cbody, e]);
+}
+ipcMain.handle('save-docx', async (e, payload) => {
+  if (denyUntrusted(e) || !payload || typeof payload !== 'object') return null;
+  const title = typeof payload.title === 'string' ? payload.title.trim().slice(0, 100) : 'Nova Documento';
+  const xml = typeof payload.documentXml === 'string' && payload.documentXml.length < 2 * 1024 * 1024 ? payload.documentXml : '';
+  if (!xml) return null;
+  try {
+    const safe = (title || 'Nova Documento').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || 'Nova Documento';
+    const f = path.join(app.getPath('downloads'), `${safe}-${new Date().toISOString().slice(0, 10)}.docx`);
+    const appXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>';
+    const rels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/></Relationships>';
+    const docRels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>';
+    const styles = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="h1"><w:name w:val="Heading 1"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="240" w:after="120"/></w:pPr><w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="h2"><w:name w:val="Heading 2"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="180" w:after="90"/></w:pPr><w:rPr><w:b/><w:sz w:val="26"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="h3"><w:name w:val="Heading 3"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="140" w:after="70"/></w:pPr><w:rPr><w:b/><w:sz w:val="22"/></w:rPr></w:style></w:styles>';
+    const now = new Date().toISOString();
+    const core = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>${title.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</dc:title><dc:creator>Nova</dc:creator><dcterms:created xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="dcterms:W3CDTF">${now}</dcterms:created></cp:coreProperties>`;
+    const appXml2 = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Nova</Application><AppVersion>3.0.0</AppVersion></Properties>';
+    const zip = zipDocx([['[Content_Types].xml', appXml],['_rels/.rels', rels],['word/document.xml', xml],['word/styles.xml', styles],['word/_rels/document.xml.rels', docRels],['docProps/core.xml', core],['docProps/app.xml', appXml2]]);
+    fs.writeFileSync(f, zip); return f;
+  } catch { return null; }
+});
+
+const keyFile = () => userFile('nova.key');
+const superCatKeyFile = () => userFile('supercat-openai.key');
+const getSuperCatKey = () => { try { return safeStorage.isEncryptionAvailable() ? safeStorage.decryptString(fs.readFileSync(superCatKeyFile())) : null; } catch { return null; } };
+ipcMain.handle('supercat-key-set', (e, k) => {
+  try {
+    if (denyUntrusted(e) || typeof k !== 'string' || k.length > 2048) return false;
+    if (!k) { fs.rmSync(superCatKeyFile(), { force: true }); return true; }
+    if (!safeStorage.isEncryptionAvailable()) return false;
+    atomicWrite(superCatKeyFile(), safeStorage.encryptString(k));
+    return true;
+  } catch { return false; }
+});
+ipcMain.handle('supercat-key-has', e => denyUntrusted(e) ? false : !!getSuperCatKey());
+ipcMain.handle('supercat-chat', async (e, data) => {
+  if (denyUntrusted(e) || !data || typeof data !== 'object') return { error: 'Solicitud no válida.' };
+  const { messages, system, model, page } = data;
+  if (!Array.isArray(messages) || messages.length > 20 || typeof system !== 'string' || system.length > 12000) return { error: 'Solicitud no válida.' };
+  if (messages.some(m => !m || typeof m !== 'object' || !['user','assistant'].includes(m.role) || typeof m.content !== 'string' || m.content.length > 12000)) return { error: 'Solicitud no válida.' };
+  const key = getSuperCatKey();
+  if (!key) return { error: 'CHATGPT_KEY_MISSING' };
+  const post = async (url, headers, body) => {
+    const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body), signal: AbortSignal.timeout(60000) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d?.error?.message || ('HTTP ' + r.status));
+    return d;
+  };
+  try {
+    let input = messages.slice(-20);
+    if (typeof page === 'string' && page.length) {
+      input = [...input, { role: 'user', content: 'Contexto de la pestaña actual:\n' + page.slice(0, 12000) }];
+    }
+    const d = await post('https://api.openai.com/v1/responses', { authorization: 'Bearer ' + key }, {
+      model: typeof model === 'string' && model.trim() ? model.trim() : 'gpt-5.6-luna',
+      instructions: system,
+      input,
+      max_output_tokens: 1200
+    });
+    return { text: String(d.output_text || ''), model: d.model || model || 'gpt-5.6-luna', src: 'openai' };
+  } catch (err) {
+    return { error: String(err?.message || err || 'Error desconocido') };
+  }
+});
+const getKey = () => { try { return safeStorage.isEncryptionAvailable() ? safeStorage.decryptString(fs.readFileSync(keyFile())) : null; } catch { return null; } };
+ipcMain.handle('key-set', (e, k) => { try { if (denyUntrusted(e) || typeof k !== 'string' || k.length > 2048) return false; if (!k) { fs.rmSync(keyFile(), { force: true }); return true; } if (!safeStorage.isEncryptionAvailable()) return false; atomicWrite(keyFile(), safeStorage.encryptString(k)); return true; } catch { return false; } });
+ipcMain.handle('key-has', e => denyUntrusted(e) ? false : !!getKey());
+ipcMain.handle('nova-ai', async (e, data) => {
+  if (denyUntrusted(e) || !data || typeof data !== 'object') return { ok:false, error:'Solicitud no válida.' };
+  const { messages, system, model } = data;
+  if (!Array.isArray(messages) || messages.length < 1 || messages.length > 20 || typeof system !== 'string' || system.length > 12000) return { ok:false, error:'Solicitud no válida.' };
+  if (messages.some(m => !m || typeof m !== 'object' || !['user','assistant'].includes(m.role) || typeof m.content !== 'string' || m.content.length > 12000)) return { ok:false, error:'Solicitud no válida.' };
+  const key = getKey();
+  if (!key) return { ok:false, error:'NOVA_KEY_MISSING' };
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method:'POST',
+      headers:{
+        'content-type':'application/json',
+        'x-api-key':key,
+        'anthropic-version':'2023-06-01',
+        'anthropic-dangerous-direct-browser-access':'true'
+      },
+      body:JSON.stringify({
+        model:typeof model==='string' && model.trim() ? model.trim() : 'claude-sonnet-4-6',
+        max_tokens:1200,
+        system,
+        messages
+      }),
+      signal:AbortSignal.timeout(60000)
+    });
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok) return { ok:false, error:String(d?.error?.message || ('HTTP '+r.status)) };
+    return { ok:true, text:String((d.content||[]).map(c=>c?.text||'').join('')), model:d.model||model||'claude-sonnet-4-6' };
+  } catch (err) { return { ok:false, error:String(err?.message||err||'Error desconocido') }; }
+});
+let stateBackupAt = 0;
+ipcMain.handle('state-save', (e, raw) => {
+  if (denyUntrusted(e) || typeof raw !== 'string' || raw.length > 8 * 1024 * 1024) return false;
+  try {
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== 'object') return false;
+    delete obj.key; // nunca guardar claves API en el backup de estado
+    const f = userFile('state-backup.json'), bak = userFile('state-backup.json.bak');
+    const data = JSON.stringify(obj);
+    // Mantén siempre la última versión válida como respaldo: si el siguiente guardado falla, se puede volver atrás.
+    if (fs.existsSync(f)) { try { fs.copyFileSync(f, bak); stateBackupAt = Date.now(); } catch { } }
+    atomicWrite(f, data);
+    return true;
+  } catch { return false; }
+});
+ipcMain.handle('state-load', e => {
+  if (denyUntrusted(e)) return null;
+  for (const f of [userFile('state-backup.json'), userFile('state-backup.json.bak')]) {
+    try { const obj = JSON.parse(fs.readFileSync(f, 'utf8')); delete obj.key; return JSON.stringify(obj); } catch { }
+  }
+  return null;
+});
+ipcMain.handle('open-external', async (e, raw) => {
+  if (denyUntrusted(e) || typeof raw !== 'string' || raw.length > 4096) return false;
+  try { const u = new URL(raw); if (u.protocol !== 'https:') return false; await shell.openExternal(u.href); return true; } catch { return false; }
+});
+
+ipcMain.handle('open-downloads-folder', async e => {
+  if (denyUntrusted(e)) return false;
+  try {
+    const result = await shell.openPath(app.getPath('downloads'));
+    return !result;
+  } catch {
+    return false;
+  }
+});
+
+ipcMain.handle('show-in-folder', (e, raw) => {
+  if (denyUntrusted(e) || typeof raw !== 'string' || raw.length > 4096) return false;
+  try { const f = path.resolve(raw); if (!fs.existsSync(f)) return false; shell.showItemInFolder(f); return true; } catch { return false; }
+});
+ipcMain.handle('save-text', async (e, payload) => {
+  if (denyUntrusted(e) || !payload || typeof payload !== 'object') return null;
+  const name = String(payload.name || 'Nova-archivo').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().slice(0, 100) || 'Nova-archivo';
+  const ext = String(payload.ext || 'txt').replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'txt';
+  const content = typeof payload.content === 'string' && payload.content.length <= 8 * 1024 * 1024 ? payload.content : null;
+  if (content === null) return null;
+  try { const f = path.join(app.getPath('downloads'), `${name}-${Date.now()}.${ext}`); fs.writeFileSync(f, content, 'utf8'); return f; } catch { return null; }
+});
+ipcMain.handle('launch-web-app', async (e, payload) => {
+  if (denyUntrusted(e) || !payload || typeof payload !== 'object') return { ok:false, error:'Solicitud no válida.' };
+  let u = ''; try { const x = new URL(String(payload.url || '')); if (!['http:','https:'].includes(x.protocol)) return { ok:false, error:'URL no válida.' }; u = x.href; } catch { return { ok:false, error:'URL no válida.' }; }
+  const name = String(payload.name || 'Nova App').replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').trim().slice(0,80) || 'Nova App';
+  const bw = new BrowserWindow({ width:1100, height:760, minWidth:600, minHeight:420, title:name, icon:logoImg(prefs.logo), webPreferences:{ nodeIntegration:false, contextIsolation:true, sandbox:true, webSecurity:true, allowRunningInsecureContent:false } });
+  bw.loadURL(u);
+  bw.setTitle(name);
+  bw.webContents.setWindowOpenHandler(({url}) => { if (/^https?:/i.test(url)) bw.loadURL(url).catch(()=>{}); return {action:'deny'}; });
+  bw.webContents.on('will-navigate',(ev,url)=>{ if(!safeWebUrl(url)) ev.preventDefault(); });
+  return { ok:true };
+});
+
+// ---------- Live news for Nova New Tab ----------
+const newsCache = new Map();
+const NEWS_SOURCES = [
+  { name: 'Ars Technica', url: 'https://feeds.arstechnica.com/arstechnica/index', site: 'https://arstechnica.com/', topics:['tecnologia','codigo'] },
+  { name: 'Ars Technica Gaming', url: 'https://feeds.arstechnica.com/arstechnica/gaming', site: 'https://arstechnica.com/gaming/', topics:['videojuegos'] },
+  { name: 'The Guardian Technology', url: 'https://www.theguardian.com/technology/rss', site: 'https://www.theguardian.com/technology', topics:['tecnologia','codigo'] },
+  { name: 'The Verge', url: 'https://www.theverge.com/rss/index.xml', site: 'https://www.theverge.com/', topics:['tecnologia','codigo'] },
+  { name: 'Engadget', url: 'https://www.engadget.com/rss.xml', site: 'https://www.engadget.com/', topics:['tecnologia'] },
+  { name: 'PC Gamer', url: 'https://www.pcgamer.com/rss/', site: 'https://www.pcgamer.com/', topics:['videojuegos','codigo'] }
+];
+const NEWS_FALLBACK = []; // Nunca presentar contenido editorial de ejemplo como si fueran noticias reales.
+const NEWS_LIVE_CACHE = () => userFile('news-live-cache.json');
+const readLiveNewsCache = () => { try { const x=JSON.parse(fs.readFileSync(NEWS_LIVE_CACHE(),'utf8')); return x&&typeof x==='object'?x:{}; } catch { return {}; } };
+const writeLiveNewsCache = x => { try { atomicWrite(NEWS_LIVE_CACHE(), JSON.stringify(x)); } catch {} };
+const newsStripHtml = v => String(v ?? '').replace(/<script[\s\S]*?<\/script>/gi,' ').replace(/<style[\s\S]*?<\/style>/gi,' ').replace(/<[^>]+>/g,' ').replace(/&nbsp;/gi,' ').replace(/&amp;/gi,'&').replace(/&quot;/gi,'"').replace(/&#39;/gi,"'").replace(/&lt;/gi,'<').replace(/&gt;/gi,'>').replace(/\s+/g,' ').trim();
+const newsXmlField = (item, tag) => { const m = item.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, 'i')); return m ? newsStripHtml(m[1]) : ''; };
+const newsLinkField = item => { let m=item.match(/<link[^>]*>([\s\S]*?)<\/link>/i); if(m)return newsStripHtml(m[1]); m=item.match(/<link[^>]+href=["']([^"']+)["'][^>]*\/?>(?:<\/link>)?/i); return m ? m[1] : ''; };
+const newsPick = (items, topic) => {
+  const terms = {
+    tecnologia: /AI|artificial|browser|web|internet|chip|memory|GPU|software|privacy|security|Microsoft|Apple|Google|Mozilla|Firefox|Linux|Windows/i,
+    videojuegos: /game|gaming|Steam|Valve|Nintendo|PlayStation|Xbox|GPU|VR|console|Doom|Minecraft|Fortnite|GTA/i,
+    codigo: /developer|programming|code|software|open source|Linux|GitHub|browser|API|AI|security|MCP|web/i
+  };
+  if(topic==='todas') return items.sort((a,b)=>(b.ts||0)-(a.ts||0)).slice(0,8);
+  const srcFiltered=items.filter(x=>Array.isArray(x.topics)&&x.topics.includes(topic));
+  const pool=srcFiltered.length?srcFiltered:items;
+  const re=terms[topic]||terms.tecnologia;
+  const ranked=pool.map(x=>({...x,score:re.test(`${x.title} ${x.summary}`)?2:0})).filter(x=>x.score>0);
+  return (ranked.length>=4?ranked:pool).sort((a,b)=>(b.ts||0)-(a.ts||0)).slice(0,6);
+};
+async function fetchNewsFeed(url, source) {
+  const r = await fetch(url, { headers:{'user-agent':'NovaBrowser/'+app.getVersion()+' (+https://github.com/sdraiky99/NovaBrowser)','accept':'application/rss+xml, application/atom+xml, text/xml;q=0.9, */*;q=0.1'}, signal:AbortSignal.timeout(7000) });
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  const xml=await r.text();
+  const rss=[...xml.matchAll(/<item\b[\s\S]*?<\/item>/gi)].map(m=>m[0]);
+  const atom=[...xml.matchAll(/<entry\b[\s\S]*?<\/entry>/gi)].map(m=>m[0]);
+  const blocks=rss.length?rss:atom;
+  return blocks.map(item=>{
+    const title=newsXmlField(item,'title');
+    let link=newsLinkField(item);
+    if(!link){ const m=item.match(/<link[^>]+href=["']([^"']+)["'][^>]*>/i); link=m?m[1]:''; }
+    const desc=newsXmlField(item,'description')||newsXmlField(item,'content:encoded')||newsXmlField(item,'summary')||newsXmlField(item,'content');
+    const dateRaw=newsXmlField(item,'pubDate')||newsXmlField(item,'dc:date')||newsXmlField(item,'published')||newsXmlField(item,'updated');
+    const ts=Date.parse(dateRaw)||0;
+    let image='';
+    let m=item.match(/<(?:media:content|media:thumbnail)[^>]+url=["']([^"']+)["'][^>]*>/i);
+    if(m)image=m[1];
+    if(!m)m=item.match(/<enclosure[^>]+url=["']([^"']+)["'][^>]*>/i);
+    if(m&& !image)image=m[1];
+    if(!image){m=String(item).match(/<img[^>]+src=["']([^"']+)["']/i);if(m)image=m[1];}
+    return title&&/^https?:/i.test(link)?{source:source.name,title,summary:desc.slice(0,360),url:link,image:/^https?:/i.test(image)?image:'',date:ts?new Date(ts).toISOString():'',ts,kind:'live',topics:source.topics||[]}:null;
+  }).filter(Boolean);
+}
+ipcMain.handle('news-feed', async (e, payload) => {
+  if (denyUntrusted(e) && !isTrustedNewTabContents(e.sender)) return { ok:false, items:[], live:false, stale:false, sources:[], error:'Origen no autorizado' };
+  const requestedTopic = String(payload?.topic || 'todas').toLowerCase();
+  const topic = ['todas', 'tecnologia', 'videojuegos', 'codigo'].includes(requestedTopic) ? requestedTopic : 'todas';
+  const force = payload?.force === true;
+  const key=topic;
+  const hit=newsCache.get(key); if(!force && hit && Date.now()-hit.at<5*60*1000) return hit.value;
+  const disk=readLiveNewsCache();
+  const stale=disk[key];
+  const results=await Promise.allSettled(NEWS_SOURCES.map(s=>fetchNewsFeed(s.url,s)));
+  const items=[]; for(const r of results) if(r.status==='fulfilled') items.push(...r.value);
+  const uniq=[...new Map(items.map(x=>[x.url,x])).values()];
+  const picked=newsPick(uniq,topic);
+  if(picked.length){
+    const value={ok:true,items:picked,live:true,stale:false,sources:[...new Set(picked.map(x=>x.source))]};
+    newsCache.set(key,{at:Date.now(),value}); disk[key]={items:picked,sources:value.sources,at:Date.now()}; writeLiveNewsCache(disk); return value;
+  }
+  if(stale?.items?.length){ const value={ok:true,items:stale.items,live:true,stale:true,sources:stale.sources||[]}; newsCache.set(key,{at:Date.now(),value}); return value; }
+  const value={ok:true,items:[],live:false,stale:false,sources:[],error:'Las fuentes de noticias no están disponibles y no hay caché local.'}; newsCache.set(key,{at:Date.now(),value}); return value;
+});
+
+let updateState = { status:'idle', current:app.getVersion(), available:false, version:'', downloaded:false, progress:0, error:'' };
+const updateInfo = info => ({ version:String(info?.version || ''), releaseDate:info?.releaseDate || '', releaseName:String(info?.releaseName || '') });
+const updateReleaseUrl = 'https://github.com/sdraiky99/NovaBrowser/releases';
+function initAutoUpdater(){
+  if(!autoUpdater) return;
+  autoUpdater.on('checking-for-update',()=>{ updateState={...updateState,status:'checking',current:app.getVersion(),error:''}; win&&!win.isDestroyed()&&win.webContents.send('update-state',updateState); });
+  autoUpdater.on('update-available',info=>{ const i=updateInfo(info); updateState={...updateState,status:'available',current:app.getVersion(),available:true,version:i.version,downloaded:false,progress:0,info:i,error:''}; win&&!win.isDestroyed()&&win.webContents.send('update-state',updateState); });
+  autoUpdater.on('update-not-available',info=>{ const i=updateInfo(info); updateState={...updateState,status:'latest',current:app.getVersion(),available:false,version:i.version||app.getVersion(),downloaded:false,progress:100,info:i,error:''}; win&&!win.isDestroyed()&&win.webContents.send('update-state',updateState); });
+  autoUpdater.on('download-progress',p=>{ updateState={...updateState,status:'downloading',available:true,version:updateState.version,downloaded:false,progress:Math.max(0,Math.min(100,Number(p?.percent)||0)),error:''}; win&&!win.isDestroyed()&&win.webContents.send('update-state',updateState); });
+  autoUpdater.on('update-downloaded',info=>{ const i=updateInfo(info); updateState={...updateState,status:'downloaded',current:app.getVersion(),available:true,version:i.version||updateState.version,downloaded:true,progress:100,info:i,error:''}; win&&!win.isDestroyed()&&win.webContents.send('update-state',updateState); });
+  autoUpdater.on('error',err=>{ updateState={...updateState,status:'error',error:String(err?.message||err)}; win&&!win.isDestroyed()&&win.webContents.send('update-state',updateState); });
+  setTimeout(()=>autoUpdater.checkForUpdates().catch(()=>{}),6500);
+}
+ipcMain.handle('update-check', async e => {
+  if (denyUntrusted(e)) return {ok:false};
+  try {
+    if(autoUpdater){
+      await autoUpdater.checkForUpdates();
+      return {ok:true,source:'electron-updater',directAvailable:true,current:app.getVersion(),state:{...updateState},url:updateReleaseUrl};
+    }
+  } catch {}
+  try {
+    const r=await fetch('https://api.github.com/repos/sdraiky99/NovaBrowser/releases/latest',{headers:{accept:'application/vnd.github+json','user-agent':'Nova/'+app.getVersion()},signal:AbortSignal.timeout(10000)});
+    if(!r.ok) return {ok:false};
+    const d=await r.json(), latest=String(d.tag_name||'').replace(/^v/,''); if(!latest)return {ok:false};
+    const parse=v=>v.split(/[^0-9]+/).slice(0,3).map(x=>Number(x)||0).reduce((a,n,i)=>a+n/1000**(i+1),0);
+    const url=String(d.html_url||''); const safe=/^https:\/\/github\.com\/sdraiky99\/NovaBrowser\/releases\/tag\/v?[0-9A-Za-z._-]+$/.test(url)?url:updateReleaseUrl;
+    return {ok:true,source:'github-api',directAvailable:false,current:app.getVersion(),latest,newer:parse(latest)>parse(app.getVersion()),url:safe};
+  } catch { return {ok:false}; }
+});
+ipcMain.handle('update-state',e=>denyUntrusted(e)?{status:'error',error:'Solicitud no válida.'}:{...updateState});
+ipcMain.handle('update-download',async e=>{
+  if(denyUntrusted(e)||!autoUpdater)return {ok:false,error:'Actualización directa no disponible en esta instalación.'};
+  try{await autoUpdater.downloadUpdate();return {ok:true};}catch(err){updateState={...updateState,status:'error',error:String(err?.message||err)};return {ok:false,error:updateState.error};}
+});
+ipcMain.handle('update-install',async e=>{
+  if(denyUntrusted(e)||!autoUpdater||!updateState.downloaded)return {ok:false,error:'No hay una actualización descargada.'};
+  try{autoUpdater.quitAndInstall(false,true);return {ok:true};}catch(err){return {ok:false,error:String(err?.message||err)};}
+});
+/* ---------- Cuenta Nova: registro, inicio de sesión y sincronización ---------- */
+ipcMain.handle('account-status', e => denyUntrusted(e) ? { loggedIn:false, id:'', username:'' } : accounts.status());
+ipcMain.handle('account-register', async (e, data) => { if (denyUntrusted(e) || !data || typeof data !== 'object') return { ok:false, error:'Solicitud no válida.' }; return accounts.register(data.username, data.password); });
+ipcMain.handle('account-login', async (e, data) => { if (denyUntrusted(e) || !data || typeof data !== 'object') return { ok:false, error:'Solicitud no válida.' }; return accounts.login(data.username, data.password); });
+ipcMain.handle('account-logout', e => denyUntrusted(e) ? { ok:false, error:'Solicitud no válida.' } : accounts.logout());
+ipcMain.handle('account-sync', async (e, data) => { if (denyUntrusted(e) || !data || typeof data !== 'object') return { ok:false, error:'Datos no válidos.' }; return accounts.sync(data); });
+
+ipcMain.handle('migration-scan', e => { if (denyUntrusted(e)) return []; try { return migration.scan(); } catch { return []; } });
+ipcMain.handle('migration-read', async (e, data) => {
+  if (denyUntrusted(e) || !data || typeof data !== 'object' || typeof data.id !== 'string' || data.id.length > 64) return { error: 'Solicitud no válida.' };
+  try { return await migration.read(data.id, { bookmarks: data.bookmarks !== false, history: data.history !== false }); } catch (err) { return { error: err.message || 'No se pudo leer el perfil.' }; }
+});
+ipcMain.handle('performance-info', async e => {
+  if (denyUntrusted(e)) return { ok: false };
+  try {
+    const sys = process.getSystemMemoryInfo ? process.getSystemMemoryInfo() : {};
+    const mainMem = process.memoryUsage();
+    const appMetrics = typeof app.getAppMetrics === 'function' ? app.getAppMetrics() : [];
+    const byPid = new Map(appMetrics.map(m => [m.pid, m]));
+    const all = webContents.getAllWebContents().filter(w => w.getType() === 'webview' && !w.isDestroyed()).slice(0, 40);
+    const tabs = await Promise.all(all.map(async w => {
+      try {
+        const m = await w.getProcessMemoryInfo();
+        const pid = typeof w.getOSProcessId === 'function' ? w.getOSProcessId() : null;
+        const metric = pid ? byPid.get(pid) : null;
+        return {
+          id: w.id,
+          pid,
+          url: String(w.getURL() || '').slice(0, 500),
+          title: String(w.getTitle() || '').slice(0, 160),
+          workingSetKB: Number(m.workingSetSize || m.residentSet || 0),
+          privateKB: Number(m.private || 0),
+          cpuPercent: Number(metric?.cpu?.percentCPUUsage || 0),
+          throttling: typeof w.getBackgroundThrottling === 'function' ? w.getBackgroundThrottling() : true
+        };
+      } catch { return null; }
+    }));
+    const totalKB = Number(sys.total || 0), freeKB = Number(sys.free || 0);
+    const mainMetric = byPid.get(process.pid);
+    return {
+      ok: true,
+      generatedAt: Date.now(),
+      main: {
+        pid: process.pid,
+        rssKB: Math.round(mainMem.rss / 1024),
+        heapUsedKB: Math.round(mainMem.heapUsed / 1024),
+        externalKB: Math.round(mainMem.external / 1024),
+        cpuPercent: Number(mainMetric?.cpu?.percentCPUUsage || 0)
+      },
+      system: { totalKB, freeKB, availableKB: Number(sys.available || 0) },
+      tabs: tabs.filter(Boolean)
+    };
+  } catch { return { ok: false }; }
+});
+ipcMain.handle('performance-mode', (e, enabled) => {
+  if (denyUntrusted(e) || typeof enabled !== 'boolean') return false;
+  for (const w of webContents.getAllWebContents()) {
+    if (w.getType() !== 'webview' || w.isDestroyed()) continue;
+    // Mantén el throttling normal de Electron siempre activado.
+    try { w.setBackgroundThrottling(true); } catch { }
+    try { w.setImageAnimationPolicy(enabled ? 'animateOnce' : 'animate'); } catch { }
+  }
+  prefs.performance = Object.assign(prefs.performance || {}, { memorySaver: enabled }); savePrefs();
+  return true;
+});
+ipcMain.handle('performance-cache', async e => {
+  if (denyUntrusted(e)) return false;
+  try { await web().clearCache(); return true; } catch { return false; }
+});
+ipcMain.handle('security-state', e => {
+  if (denyUntrusted(e)) return {};
+  return { popupBlocked: true, insecureContentBlocked: true, webSecurity: true, webviewSandbox: true, webviewNodeIntegration: false, fileAccessFromFileUrls: false, universalAccessFromFileUrls: false, singleInstance: !!gotLock, adblock: blockOn === true, csp: true };
+});
+ipcMain.handle('ai-ask', async (e, data) => {
+  if (denyUntrusted(e) || !data || typeof data !== 'object') return { error: 'Solicitud no válida.' };
+  const { msgs, system, model } = data;
+  if (!Array.isArray(msgs) || msgs.length > 30 || typeof system !== 'string' || system.length > 50000 || (model !== undefined && typeof model !== 'string')) return { error: 'Solicitud no válida.' };
+  if (msgs.some(m => !m || typeof m !== 'object' || !['user','assistant'].includes(m.role) || typeof m.content !== 'string' || m.content.length > 20000)) return { error: 'Solicitud no válida.' };
+  const post = async (url, headers, body) => { const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body), signal: AbortSignal.timeout(60000) }); if (!r.ok && r.status !== 400) throw new Error('HTTP ' + r.status); return r.json(); };
+  try {
+    const k = getKey();
+    if (k) { const d = await post('https://api.anthropic.com/v1/messages', { 'x-api-key': k, 'anthropic-version': '2023-06-01' }, { model: model || 'claude-sonnet-4-6', max_tokens: 1500, system, messages: msgs }); if (d.error) return { error: d.error.message }; return { text: d.content.map(c => c.text || '').join(''), src: 'claude' }; }
+    const d = await post('https://text.pollinations.ai/openai', {}, { model: 'openai', messages: [{ role: 'system', content: system }, ...msgs] });
+    return { text: d.choices?.[0]?.message?.content || 'Sin respuesta.', src: 'free' };
+  } catch (e) { return { error: e.message }; }
+});
+// Nova Assist: local Ollama support. Only fixed loopback endpoints are called; no arbitrary URL is accepted.
+ipcMain.handle('ollama-models', async e => {
+  if (denyUntrusted(e)) return { ok:false, error:'Solicitud no válida.' };
+  try {
+    const r = await fetch('http://127.0.0.1:11434/api/tags', { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return { ok:false, error:`Ollama respondió HTTP ${r.status}.` };
+    const data = await r.json().catch(() => ({}));
+    const models = Array.isArray(data.models) ? data.models.map(x => String(x?.name || '').trim()).filter(Boolean).slice(0,100) : [];
+    return { ok:true, models };
+  } catch {
+    return { ok:false, error:'No se encuentra Ollama en este equipo. Instálalo, inicia Ollama y descarga un modelo compatible.' };
+  }
+});
+ipcMain.handle('ollama-ai', async (e, data) => {
+  if (denyUntrusted(e) || !data || typeof data !== 'object') return { ok:false, error:'Solicitud no válida.' };
+  const { messages, system, model } = data;
+  if (!Array.isArray(messages) || messages.length < 1 || messages.length > 20 || typeof system !== 'string' || system.length > 12000 || typeof model !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$/.test(model)) return { ok:false, error:'Parámetros de IA local no válidos.' };
+  if (messages.some(m => !m || typeof m !== 'object' || !['user','assistant'].includes(m.role) || typeof m.content !== 'string' || m.content.length > 16000)) return { ok:false, error:'El mensaje supera los límites admitidos.' };
+  try {
+    const r = await fetch('http://127.0.0.1:11434/api/chat', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body:JSON.stringify({ model, stream:false, messages:[{role:'system',content:system}, ...messages.slice(-16)], options:{num_ctx:4096} }),
+      signal:AbortSignal.timeout(90000)
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) return { ok:false, error:String(d?.error || `Ollama respondió HTTP ${r.status}`).slice(0,500) };
+    const text = String(d?.message?.content || '').trim();
+    return text ? { ok:true, text, model:String(d?.model || model), src:'ollama' } : { ok:false, error:'El modelo local no devolvió una respuesta. Comprueba que esté descargado y vuelve a intentarlo.' };
+  } catch (err) {
+    const msg = String(err?.message || err || 'Error desconocido');
+    return { ok:false, error:msg.includes('timeout') ? 'El modelo tardó demasiado en responder. Prueba uno más pequeño.' : 'No se pudo conectar con Ollama. Comprueba que esté instalado y ejecutándose.' };
+  }
+});
+
+ipcMain.handle('clear-data', async (e, o) => {
+  if (denyUntrusted(e) || !o || typeof o !== 'object') return false;
+  const s = web(), st = []; if (o.cookies) st.push('cookies'); if (o.storage) st.push('localstorage', 'indexdb', 'serviceworkers', 'cachestorage', 'websql', 'filesystem');
+  if (st.length) await s.clearStorageData({ storages: st }); if (o.cache) await s.clearCache(); return true;
+});
+ipcMain.handle('clear', async e => {
+  if (denyUntrusted(e)) return false; await web().clearStorageData(); await web().clearCache(); return true; });
+
+/* ---------- Nova 5.1 · diagnóstico y recuperación segura ---------- */
+ipcMain.handle('nova51-diagnostics', e => {
+  if (denyUntrusted(e)) return { ok:false, error:'Solicitud no válida.' };
+  const exists = f => { try { return fs.existsSync(f); } catch { return false; } };
+  const readJson = f => { try { return JSON.parse(fs.readFileSync(f,'utf8')); } catch { return null; } };
+  const pf = prefsFile(), sb = userFile('state-backup.json'), bak = userFile('state-backup.json.bak');
+  let prefsOk=false, stateOk=false, backupOk=false;
+  try { const x=readJson(pf); prefsOk=!!x && typeof x==='object'; } catch {}
+  try { const x=readJson(sb); stateOk=!!x && typeof x==='object'; } catch {}
+  try { const x=readJson(bak); backupOk=!!x && typeof x==='object'; } catch {}
+  return {
+    ok:true, version:app.getVersion(), electron:process.versions.electron, chromium:process.versions.chrome,
+    prefs:{ ok:prefsOk, path:pf, logo:'quantum' },
+    state:{ ok:stateOk, backup:backupOk, backupPath:bak },
+    prime:{ iconPng:exists(path.join(__dirname,'assets','brand','nova-icon.png')), iconIco:exists(path.join(__dirname,'assets','brand','nova.ico')), legacyLogoDir:false, legacyThemeFile:false },
+    renderer:{ nodeIntegration:true, contextIsolation:false, note:'Legacy renderer compatibility; migration is intentionally separated from this stability release.' },
+  };
+});
+ipcMain.handle('nova51-restore-backup', e => {
+  if (denyUntrusted(e)) return {ok:false,error:'Solicitud no válida.'};
+  const backup=userFile('state-backup.json.bak');
+  try {
+    if (!fs.existsSync(backup)) return {ok:false,error:'No hay una copia de seguridad disponible.'};
+    const obj=JSON.parse(fs.readFileSync(backup,'utf8')); if(!obj||typeof obj!=='object'||Array.isArray(obj)) return {ok:false,error:'La copia no es válida.'};
+    delete obj.key; atomicWrite(userFile('state-backup.json'),JSON.stringify(obj));
+    return {ok:true,state:JSON.stringify(obj)};
+  } catch(err){ return {ok:false,error:String(err?.message||err)}; }
+});
+ipcMain.handle('nova51-export-state', e => {
+  if (denyUntrusted(e)) return null;
+  try { const raw=fs.readFileSync(userFile('state-backup.json'),'utf8'); JSON.parse(raw); return raw; } catch { return null; }
+});
+
+app.on('window-all-closed', () => app.quit());

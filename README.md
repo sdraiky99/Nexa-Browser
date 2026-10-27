@@ -1,65 +1,72 @@
-# Nexa Browser — MVP
+# Nova 6.3.1 — Minimal Reborn
 
-Primer prototipo ejecutable de **Nexa Browser**, basado en Electron. Está pensado como una base real para seguir construyendo el navegador definido durante la planificación.
+Nova es un navegador de escritorio basado en Electron/Chromium. La versión 6.3.1 — Minimal Reborn combina una interfaz más limpia, acentos personalizables, un tema secreto y un asistente de IA opcional con mejoras de continuidad y distribución. Mantiene temas claro/oscuro/sistema e iconos locales.
 
-## Incluido en este MVP
+## Lo más destacado
 
-- Identidad visual Nexa: azul futurista, glassmorphism, interfaz limpia.
-- Tema automático como base.
-- Pestañas, nueva pestaña, navegación atrás/adelante/recarga.
-- Barra flotante/translúcida con búsqueda y URL.
-- Barra lateral con espacios de trabajo y paneles.
-- Workspaces con identidad visual y espacios temporales conceptuales.
-- Panel personalizable con los widgets definidos.
-- Notas locales.
-- IA opcional/local como superficie preparada.
-- Buscador configurable.
-- Modo concentración.
-- Función "Comparar páginas" marcada como experimental.
-- Bloqueo básico de determinados anuncios/rastreadores a nivel de red.
-- Ajuste de intensidad glassmorphism.
-- Importación/recomendación de configuración como superficie preparada.
+- **Nueva marca Nova:** N geométrica minimalista con profundidad sutil y fondo transparente, usada en la interfaz, el splash, el favicon y los recursos de Windows.
+- **Navegación y nueva pestaña:** búsqueda por URL o consulta, accesos rápidos editables y noticias opcionales desde fuentes identificables.
+- **Continuidad:** preferencias guardadas, restauración de hasta 50 pestañas web y grupos en los casos compatibles con el estado almacenado.
+- **Herramientas:** marcadores, historial, panel lateral, gestor de descargas, importador de marcadores/historial, permisos por sitio y gestión de extensiones Chromium desempaquetadas.
+- **Setup y Portable:** configurados con directorios de compilación independientes y perfiles separados.
+- **IA integrada:** Nova Assist admite Ollama local o el proveedor online preexistente; el contenido de una página se incluye únicamente cuando el usuario lo marca explícitamente.
+- **Personalización:** nueve acentos, color personalizado, tema secreto Eclipse y modo Focus.
+- **Validación:** comprobaciones del proyecto, sintaxis JavaScript, lógica de distribución, recursos gráficos y un microbenchmark acotado de resolución de URL/búsqueda.
 
-## Ejecutar
+Las limitaciones de compatibilidad de Electron y las verificaciones pendientes se describen en `RELEASE_NOTES_6.3.1.md` y `VALIDATION_6.3.1.txt`.
 
-Necesitas Node.js y npm.
+## Distribuciones de Windows
 
-```bash
-npm install
-npm start
+### Setup — instalación por usuario
+
+El instalador NSIS es asistido y está configurado para el usuario actual, sin solicitar elevación como comportamiento normal: `oneClick: false`, `perMachine: false`, `allowElevation: false`. Crea accesos directos en Escritorio y menú Inicio. No borra de forma silenciosa los datos personales al desinstalar.
+
+Ruta esperada: `dist/setup/Nova-Setup-6.3.1.exe`.
+
+### Portable
+
+No requiere instalación. Cuando la carpeta permite escritura, guarda el perfil en `User Data` junto al ejecutable. Si la carpeta no es escribible, la aplicación usa el perfil de Windows como alternativa e informa del modo de funcionamiento. Un Portable nuevo no copia automáticamente los datos de Setup.
+
+Ruta esperada: `dist/portable/Nova-Portable-6.3.1.exe`.
+
+## Compilar
+
+Requisitos declarados: Windows para generar los ejecutables de Windows, Node.js `>=22.12.0` y npm. Las dependencias directas están fijadas en `package.json`. Este paquete no incluye `package-lock.json`; npm resolverá dependencias transitivas al instalar. Para una publicación reproducible conviene generar y revisar un lockfile en un entorno conectado antes de publicar.
+
+```powershell
+npm install --no-audit --no-fund --engine-strict
+npm run check
+npm run dist:setup
+npm run dist:portable
 ```
 
-## Importante
+`npm run dist` compila las dos ediciones en secuencia. Los artefactos se escriben en carpetas distintas para que la compilación Portable no sobrescriba el Setup.
 
-Este proyecto es un **MVP técnico**, no pretende afirmar que todas las protecciones de privacidad, compatibilidad con extensiones Firefox, sincronización E2EE, DNS seguro, fingerprinting protection o IA local estén terminadas. Esas piezas requieren módulos específicos y pruebas de seguridad independientes.
+## Comprobaciones
 
-La siguiente arquitectura prevista es:
-
-- Motor web y aislamiento de sitios.
-- Capa de privacidad configurable.
-- Servicio de identidad Nexa.
-- Sync con cifrado de extremo a extremo y gestión de claves.
-- Adaptador para extensiones Firefox.
-- Runtime de automatización.
-- Integración de IA local mediante un proveedor/modelo configurable.
-- Cliente Android con la misma lógica de cuenta/sync.
-
-
-## Releases automáticos con GitHub Actions
-
-El repositorio incluye dos workflows:
-
-- `Nexa CI`: comprueba que el proyecto instala y compila correctamente en cada push/PR.
-- `Release Nexa Browser`: al subir un tag `vX.Y.Z`, compila instaladores para Windows y Linux y crea automáticamente un GitHub Release con los archivos generados.
-
-Ejemplo:
-
-```bash
-git add .
-git commit -m "release: Nexa Browser 0.1.0"
-git push origin main
-git tag v0.1.0
-git push origin v0.1.0
+```powershell
+npm run check:distribution-config
+npm run check:project
+npm run check:syntax
+npm run qa:6.3
+npm run check:build-assets
+npm run check:performance
 ```
 
-No necesitas crear el Release manualmente. GitHub Actions lo hará por ti.
+Las pruebas estáticas y de lógica no equivalen a abrir y probar el navegador con páginas reales. En esta entrega no se afirma que los `.exe` se hayan compilado o probado en Windows; los workflows de GitHub Actions deben completar esa parte.
+
+## Seguridad y límites conocidos
+
+- No se promete compatibilidad universal con Chrome Web Store ni con todos los APIs de extensiones.
+- La importación no intenta descifrar contraseñas ni extraer secretos.
+- El renderer local principal aún conserva `nodeIntegration: true` y `contextIsolation: false` por dependencias heredadas; la migración completa requiere una refactorización específica y pruebas de regresión.
+- Las mediciones del script de rendimiento solo cubren la función pura de resolución de navegación, no el arranque completo, la red, las páginas remotas ni el consumo de RAM.
+- No se entrega `package-lock.json` en este paquete.
+
+## Nova Assist (6.3.1)
+
+La IA puede funcionar en modo local con Ollama instalado por separado o en modo online mediante el proveedor integrado. El modo online envía las consultas a un servicio externo. El contexto de la página actual solo se incluye si marcas esa opción en Nova Assist.
+
+**Para probar el modo local:** instala e inicia Ollama por separado, ejecuta `ollama pull qwen2.5:3b`, abre Nova Assist y pulsa «Comprobar conexión local». Si tienes otro modelo instalado, escribe su nombre exacto. Nova usa únicamente `127.0.0.1:11434`; no hay un campo para enviar la app a un endpoint arbitrario. Si Ollama no está instalado, puedes elegir el modo online o seguir usando Nova como navegador normal.
+
+**Modo online:** cuando se usa, la consulta se envía a un servicio externo. No incluyas la página actual ni información privada si no quieres compartirla con ese proveedor.
